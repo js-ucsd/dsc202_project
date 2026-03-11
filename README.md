@@ -19,13 +19,13 @@ It then exposes a small API and demo UI to answer the competency questions in `r
 
 ### Quickstart
 
-1) Bring up the stores (Postgres, Neo4j, Qdrant):
+#### 1) Bring up the stores (Postgres, Neo4j, Qdrant)
 
 ```bash
 docker compose -f infra/docker-compose.yml up -d
 ```
 
-2) Create a virtual environment and install deps:
+#### 2) Create a virtual environment and install deps
 
 ```bash
 python3 -m venv .venv
@@ -34,25 +34,44 @@ pip install -r requirements.txt
 pip install -e packages/pipeline
 ```
 
-3) Copy env and fill in values as needed:
+#### 3) Copy env and fill in values as needed
 
 ```bash
 cp .env.example .env
 ```
 
-4) Ingest a subset of the dataset (recommended for development):
+#### 4) Choose a source dataset (CSV → Parquet)
+
+The ingestion pipeline prefers Parquet for speed and convenience. Two common options:
+
+- **Full dataset**: `data/raw/dblp-v10.parquet` (already generated from the CSV)
+- **Sample dataset**: `data/raw/dblp-v10-sample.parquet` (50k-row subset for fast dev)
+
+You can still pass a CSV path; the code will detect the extension and fall back to CSV reading when needed.
+
+#### 5) Ingest a subset (recommended for development)
+
+Examples:
+
+- From the **full Parquet**:
 
 ```bash
-python3 -m pipeline.cli --csv data/raw/dblp-v10.csv --limit 5000
+python3 -m pipeline.cli --csv data/raw/dblp-v10.parquet --limit 5000
 ```
 
-If you want to **wipe and reload everything fresh** (all three stores), add `--truncate`:
+- From the **50k sample Parquet**:
 
 ```bash
-python3 -m pipeline.cli --csv data/raw/dblp-v10.csv --limit 5000 --truncate
+python3 -m pipeline.cli --csv data/raw/dblp-v10-sample.parquet --limit 50000
 ```
 
-5) Run the API (terminal 1):
+If you want to **wipe and reload everything fresh** (all three stores), add `--truncate` to either command:
+
+```bash
+python3 -m pipeline.cli --csv data/raw/dblp-v10.parquet --limit 5000 --truncate
+```
+
+#### 6) Run the API (terminal 1)
 
 ```bash
 cd /Users/js/Downloads/DSC202_Project_V2
