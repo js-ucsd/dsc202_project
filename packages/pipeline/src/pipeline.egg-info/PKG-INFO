@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: pipeline
+Version: 0.1.0
+Summary: DBLP -> Postgres/Neo4j/Qdrant ingestion and query helpers
+Requires-Python: >=3.11
