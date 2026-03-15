@@ -167,7 +167,7 @@ with tab2:
 
     st.divider()
     st.subheader("Indirect citers of a paper (citation paths)")
-    pid = st.text_input("Paper UUID", value="")
+    pid = st.text_input("Paper UUID", value="56cd3fdb-73ff-431e-8945-d673f9469f33")
     hops = st.slider("Max hops", 1, 5, 3)
     if st.button("Find indirect citers"):
         if not pid.strip():
@@ -184,7 +184,7 @@ with tab2:
 with tab3:
     st.caption("Blend vector similarity with relational and graph analytics.")
     st.subheader("Citations vs similarity")
-    q2 = st.text_input("Topic query", value="entity resolution blocking techniques")
+    q2 = st.text_input("Topic query", value="deep learning")
     if st.button("Analyze citations vs similarity"):
         data = _call_api("/citations_vs_similarity", {"q": q2, "k": 20})
         if data:
@@ -193,7 +193,7 @@ with tab3:
 
     st.divider()
     st.subheader("Emerging trends (recent papers similar to query)")
-    since = st.number_input("Since year", value=2020, min_value=1950, max_value=2100)
+    since = st.number_input("Since year", value=2015, min_value=1950, max_value=2100)
     if st.button("Find emerging papers"):
         data = _call_api(
             "/emerging_trends", {"q": q2, "since_year": int(since), "k": 20}
