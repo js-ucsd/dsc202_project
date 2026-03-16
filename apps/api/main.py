@@ -38,7 +38,7 @@ def health() -> dict[str, str]:
 def stats(
     paper_ids: Optional[List[str]] = Query(None, description="When set, Postgres stats are restricted to these papers (topic scope)"),
 ) -> dict[str, Any]:
-    """Dashboard statistics from all three stores. Optionally restrict Postgres stats to paper_ids."""
+    """Dashboard statistics from all three stores. Optionally restrict metrics to a scoped set of paper_ids (topic scope)."""
     with pg_conn() as conn, conn.cursor() as cur:
         if paper_ids:
             cur.execute(
@@ -99,17 +99,68 @@ def stats(
             )
             papers_by_year = [{"year": r[0], "count": r[1]} for r in cur.fetchall()]
 
-    # Neo4j counts (always global)
+    # Neo4j counts
     driver = neo4j_driver()
     with driver.session() as s:
-        neo4j_nodes = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
-        neo4j_rels = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+        if paper_ids:
+            scoped_ids = paper_ids[:500]
+            # Nodes: scoped papers + their authors
+            nodes_row = s.run(
+                """
+                MATCH (p:Paper)
+                WHERE p.paperId IN $paper_ids
+                OPTIONAL MATCH (a:Author)-[:WROTE]->(p)
+                RETURN count(DISTINCT p) AS paper_nodes,
+                       count(DISTINCT a) AS author_nodes
+                """,
+                paper_ids=scoped_ids,
+            ).single()
+            paper_nodes = nodes_row["paper_nodes"] if nodes_row else 0
+            author_nodes = nodes_row["author_nodes"] if nodes_row else 0
+
+            # Relationships: WROTE edges to scoped papers + CITES edges between scoped papers
+            rels_row = s.run(
+                """
+                MATCH (a:Author)-[w:WROTE]->(p:Paper)
+                WHERE p.paperId IN $paper_ids
+                WITH collect(DISTINCT w) AS wrote_rels
+                MATCH (p1:Paper)-[c:CITES]->(p2:Paper)
+                WHERE p1.paperId IN $paper_ids AND p2.paperId IN $paper_ids
+                RETURN size(wrote_rels) AS wrote_count, count(DISTINCT c) AS cites_count
+                """,
+                paper_ids=scoped_ids,
+            ).single()
+            wrote_count = rels_row["wrote_count"] if rels_row else 0
+            cites_count = rels_row["cites_count"] if rels_row else 0
+
+            neo4j_nodes = paper_nodes + author_nodes
+            neo4j_rels = wrote_count + cites_count
+        else:
+            neo4j_nodes = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+            neo4j_rels = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
     driver.close()
 
-    # Qdrant count (always global)
+    # Qdrant count
     qc = qdrant_client()
-    col = qc.get_collection(settings.qdrant_collection)
-    qdrant_vectors = col.points_count
+    if paper_ids:
+        scoped_ids = paper_ids[:500]
+        # Build a Qdrant filter that matches any of the scoped paper IDs
+        conditions = [
+            qm.FieldCondition(
+                key="paper_id",
+                match=qm.MatchValue(value=pid),
+            )
+            for pid in scoped_ids
+        ]
+        count_res = qc.count(
+            collection_name=settings.qdrant_collection,
+            count_filter=qm.Filter(should=conditions),
+            exact=True,
+        )
+        qdrant_vectors = count_res.count
+    else:
+        col = qc.get_collection(settings.qdrant_collection)
+        qdrant_vectors = col.points_count
 
     return {
         "postgres": {
@@ -398,6 +449,42 @@ def filter_avg_citations_per_year(
             rows = cur.fetchall()
     results = [{"year": r[0], "avg_citations": float(r[1])} for r in rows]
     return {"results": results, _J: "GROUP BY year, AVG(n_citation).", "sql": sql}
+
+
+@app.get("/filter/distinct_venues")
+def filter_distinct_venues(
+    paper_ids: Optional[List[str]] = Query(
+        None, description="Restrict to venues appearing in these paper IDs (topic scope)"
+    ),
+) -> dict[str, Any]:
+    """
+    List distinct non-empty venues.
+
+    When paper_ids is provided, restricts venues to those that appear in the scoped paper set.
+    Intended for populating venue dropdowns in the UI.
+    """
+    if paper_ids:
+        sql = """
+        SELECT DISTINCT venue
+        FROM papers
+        WHERE venue IS NOT NULL AND trim(venue) != '' AND id = ANY(%s::uuid[])
+        ORDER BY venue
+        """
+        params: tuple[Any, ...] = (paper_ids,)
+    else:
+        sql = """
+        SELECT DISTINCT venue
+        FROM papers
+        WHERE venue IS NOT NULL AND trim(venue) != ''
+        ORDER BY venue
+        """
+        params = tuple()
+
+    with pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql.strip(), params)
+        rows = cur.fetchall()
+    results = [{"venue": r[0]} for r in rows]
+    return {"results": results, _J: "DISTINCT venues from papers; optionally restricted to topic scope."}
 
 
 @app.get("/filter/venues_by_paper_count")
@@ -1100,8 +1187,16 @@ def indirect_citers(
 def author_clusters_by_venue(venue: str, top_k: int = 5) -> dict[str, Any]:
     """
     Which author clusters dominate a research field?
-    Approximate 'field' by venue string; compute communities on co-authorship graph
+    Approximate 'field' by venue string; compute communities on a co-authorship graph
     restricted to papers in that venue using Neo4j Graph Data Science (Louvain).
+
+    Returns clusters enriched with:
+    - author_count: number of authors in the cluster
+    - papers_in_venue: distinct papers in the venue with at least one author from the cluster
+    - share_of_venue: percentage of venue papers contributed by the cluster
+    - top_authors: sample of author names for preview
+    - all_authors: full list of author names in the cluster
+    - neo4j_query: Cypher snippet to visualize the cluster's co-author subgraph
     """
     driver = neo4j_driver()
     with driver.session() as s:
@@ -1112,6 +1207,16 @@ def author_clusters_by_venue(venue: str, top_k: int = 5) -> dict[str, Any]:
             s.run(
                 "CALL gds.graph.drop('venueGraph') YIELD graphName RETURN graphName"
             ).consume()
+
+        # Compute total papers in this venue for share-of-venue calculation
+        total_papers_row = s.run(
+            """
+            MATCH (p:Paper)-[:PUBLISHED_IN]->(v:Venue {venueName: $venue})
+            RETURN count(DISTINCT p) AS total_papers
+            """,
+            venue=venue,
+        ).single()
+        total_papers = total_papers_row["total_papers"] if total_papers_row else 0
 
         # Use Cypher aggregation projection (modern GDS syntax)
         s.run(
@@ -1126,20 +1231,84 @@ def author_clusters_by_venue(venue: str, top_k: int = 5) -> dict[str, Any]:
             venue=venue,
         ).consume()
 
-        # Louvain community detection
-        communities = list(
+        # Louvain community detection and enrichment
+        # 1) Run Louvain and collect authors per community
+        community_rows = list(
             s.run(
                 """
                 CALL gds.louvain.stream('venueGraph', {relationshipWeightProperty: 'weight'})
                 YIELD nodeId, communityId
-                RETURN communityId, count(*) AS size
-                ORDER BY size DESC
+                WITH communityId, gds.util.asNode(nodeId) AS a
+                WITH communityId, collect(DISTINCT a) AS authors, count(*) AS author_count
+                ORDER BY author_count DESC
                 LIMIT $k
+                RETURN communityId, authors, author_count
                 """,
                 k=top_k,
             )
         )
-        top = [r.data() for r in communities]
+
+        clusters: list[dict[str, Any]] = []
+        for rank, row in enumerate(community_rows, start=1):
+            data = row.data()
+            community_id = data["communityId"]
+            authors = data["authors"]
+            author_count = data["author_count"]
+            author_names = [a["authorName"] for a in authors]
+
+            # Papers in venue that involve at least one author from this cluster
+            papers_row = s.run(
+                """
+                MATCH (a:Author)-[:WROTE]->(p:Paper)-[:PUBLISHED_IN]->(v:Venue {venueName: $venue})
+                WHERE a.authorName IN $author_names
+                RETURN count(DISTINCT p) AS papers_in_venue
+                """,
+                venue=venue,
+                author_names=author_names,
+            ).single()
+            papers_in_venue = papers_row["papers_in_venue"] if papers_row else 0
+
+            share_of_venue = (
+                float(papers_in_venue) * 100.0 / total_papers if total_papers else 0.0
+            )
+
+            top_authors = author_names[:5]
+            cluster_label = (
+                f"Cluster {rank} ({top_authors[0]} et al.)"
+                if top_authors
+                else f"Cluster {rank}"
+            )
+
+            # Pre-baked Cypher query for Neo4j Browser visualization of this cluster
+            # Inline author names for copy-paste convenience
+            escaped_names = [name.replace('"', '\\"') for name in author_names]
+            author_list_literal = "[" + ", ".join(f'"{n}"' for n in escaped_names) + "]"
+            neo4j_query = (
+                "MATCH (a:Author)-[:WROTE]->(p:Paper)-[:PUBLISHED_IN]->"
+                f"(v:Venue {{venueName: \"{venue}\"}})\n"
+                f"WHERE a.authorName IN {author_list_literal}\n"
+                "WITH collect(DISTINCT a) AS authors\n"
+                "UNWIND authors AS a1\n"
+                "UNWIND authors AS a2\n"
+                "WITH DISTINCT a1, a2\n"
+                "MATCH path = (a1)-[:WROTE]->(:Paper)<-[:WROTE]-(a2)\n"
+                "RETURN path\n"
+                "LIMIT 500;"
+            )
+
+            clusters.append(
+                {
+                    "rank": rank,
+                    "community_id": community_id,
+                    "cluster_label": cluster_label,
+                    "author_count": author_count,
+                    "papers_in_venue": papers_in_venue,
+                    "share_of_venue": round(share_of_venue, 2),
+                    "top_authors": top_authors,
+                    "all_authors": author_names,
+                    "neo4j_query": neo4j_query,
+                }
+            )
 
         s.run(
             "CALL gds.graph.drop('venueGraph') YIELD graphName RETURN graphName"
@@ -1147,7 +1316,8 @@ def author_clusters_by_venue(venue: str, top_k: int = 5) -> dict[str, Any]:
     driver.close()
     return {
         "venue": venue,
-        "top_communities": top,
+        "total_papers_in_venue": total_papers,
+        "clusters": clusters,
         "store_justification": "Communities/clusters are graph structure. Neo4j GDS provides community detection directly on the co-authorship graph.",
         "note": "Field is approximated by venue for the MVP; you can replace this with a richer field taxonomy later.",
     }
@@ -1195,10 +1365,19 @@ def emerging_trends(q: str, since_year: int = 2020, k: int = 20) -> dict[str, An
 
 
 @app.get("/bridge_authors")
-def bridge_authors(limit: int = 20) -> dict[str, Any]:
+def bridge_authors(
+    limit: int = 20,
+    paper_ids: Optional[List[str]] = Query(
+        None, description="When set, restrict the co-authorship graph to these papers (topic scope)"
+    ),
+) -> dict[str, Any]:
     """
     Which authors act as bridges between research domains?
     Uses Neo4j GDS betweenness centrality on the co-authorship graph.
+
+    When paper_ids is provided, the projected co-authorship graph is restricted
+    to authors connected via the scoped paper set. This makes 'bridge authors'
+    topic-aware instead of global.
     """
     driver = neo4j_driver()
     with driver.session() as s:
@@ -1211,15 +1390,28 @@ def bridge_authors(limit: int = 20) -> dict[str, Any]:
             ).consume()
 
         # Use Cypher aggregation projection (modern GDS syntax)
-        s.run(
-            """
-            MATCH (a1:Author)-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
-            WHERE id(a1) < id(a2)
-            WITH a1, a2, count(p) AS weight
-            WITH gds.graph.project('coauthorGraph', a1, a2, {relationshipProperties: {weight: weight}}) AS g
-            RETURN g.graphName AS graph, g.nodeCount AS nodes, g.relationshipCount AS rels
-            """
-        ).consume()
+        if paper_ids:
+            scoped_ids = paper_ids[:500]
+            s.run(
+                """
+                MATCH (a1:Author)-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+                WHERE id(a1) < id(a2) AND p.paperId IN $paper_ids
+                WITH a1, a2, count(p) AS weight
+                WITH gds.graph.project('coauthorGraph', a1, a2, {relationshipProperties: {weight: weight}}) AS g
+                RETURN g.graphName AS graph, g.nodeCount AS nodes, g.relationshipCount AS rels
+                """,
+                paper_ids=scoped_ids,
+            ).consume()
+        else:
+            s.run(
+                """
+                MATCH (a1:Author)-[:WROTE]->(p:Paper)<-[:WROTE]-(a2:Author)
+                WHERE id(a1) < id(a2)
+                WITH a1, a2, count(p) AS weight
+                WITH gds.graph.project('coauthorGraph', a1, a2, {relationshipProperties: {weight: weight}}) AS g
+                RETURN g.graphName AS graph, g.nodeCount AS nodes, g.relationshipCount AS rels
+                """
+            ).consume()
 
         rows = [
             r.data()
@@ -1235,13 +1427,132 @@ def bridge_authors(limit: int = 20) -> dict[str, Any]:
                 limit=limit,
             )
         ]
+
+        # Enrich with coauthor degree from the co-authorship graph
+        authors = [r["author"] for r in rows]
+        if authors:
+            if paper_ids:
+                degree_rows = s.run(
+                    """
+                    MATCH (a:Author)-[:WROTE]->(p:Paper)<-[:WROTE]-(co:Author)
+                    WHERE a.authorName IN $authors AND p.paperId IN $paper_ids AND a <> co
+                    RETURN a.authorName AS author, count(DISTINCT co) AS coauthor_count
+                    """,
+                    authors=authors,
+                    paper_ids=paper_ids[:500],
+                )
+            else:
+                degree_rows = s.run(
+                    """
+                    MATCH (a:Author)-[:WROTE]->(:Paper)<-[:WROTE]-(co:Author)
+                    WHERE a.authorName IN $authors AND a <> co
+                    RETURN a.authorName AS author, count(DISTINCT co) AS coauthor_count
+                    """,
+                    authors=authors,
+                )
+            coauthor_degree: dict[str, int] = {}
+            for dr in degree_rows:
+                d = dr.data()
+                coauthor_degree[d["author"]] = d["coauthor_count"]
         s.run(
             "CALL gds.graph.drop('coauthorGraph') YIELD graphName RETURN graphName"
         ).consume()
     driver.close()
+
+    # Enrich with scoped paper counts and top 2 venues from Postgres
+    scoped_papers_by_author: dict[str, int] = {}
+    venues_by_author: dict[str, dict[str, int]] = {}
+    if authors:
+        with pg_conn() as conn, conn.cursor() as cur:
+            # Scoped papers per author
+            if paper_ids:
+                cur.execute(
+                    """
+                    SELECT a.name,
+                           count(DISTINCT p.id) AS scoped_papers
+                    FROM authors a
+                    JOIN paper_authors pa ON pa.author_id = a.author_id
+                    JOIN papers p ON p.id = pa.paper_id
+                    WHERE a.name = ANY(%s) AND p.id = ANY(%s::uuid[])
+                    GROUP BY a.name
+                    """,
+                    (authors, paper_ids[:500]),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT a.name,
+                           count(DISTINCT p.id) AS scoped_papers
+                    FROM authors a
+                    JOIN paper_authors pa ON pa.author_id = a.author_id
+                    JOIN papers p ON p.id = pa.paper_id
+                    WHERE a.name = ANY(%s)
+                    GROUP BY a.name
+                    """,
+                    (authors,),
+                )
+            for name, scoped_papers in cur.fetchall():
+                scoped_papers_by_author[name] = int(scoped_papers)
+
+            # Venue counts per author
+            if paper_ids:
+                cur.execute(
+                    """
+                    SELECT a.name, p.venue, count(*) AS cnt
+                    FROM authors a
+                    JOIN paper_authors pa ON pa.author_id = a.author_id
+                    JOIN papers p ON p.id = pa.paper_id
+                    WHERE a.name = ANY(%s)
+                      AND p.id = ANY(%s::uuid[])
+                      AND p.venue IS NOT NULL AND trim(p.venue) != ''
+                    GROUP BY a.name, p.venue
+                    """,
+                    (authors, paper_ids[:500]),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT a.name, p.venue, count(*) AS cnt
+                    FROM authors a
+                    JOIN paper_authors pa ON pa.author_id = a.author_id
+                    JOIN papers p ON p.id = pa.paper_id
+                    WHERE a.name = ANY(%s)
+                      AND p.venue IS NOT NULL AND trim(p.venue) != ''
+                    GROUP BY a.name, p.venue
+                    """,
+                    (authors,),
+                )
+            for name, venue, cnt in cur.fetchall():
+                if name not in venues_by_author:
+                    venues_by_author[name] = {}
+                venues_by_author[name][venue] = venues_by_author[name].get(venue, 0) + int(cnt)
+
+    enriched = []
+    for r in rows:
+        author = r["author"]
+        score = r["score"]
+        co_deg = coauthor_degree.get(author, 0)
+        scoped_papers = scoped_papers_by_author.get(author, 0)
+        venue_counts = venues_by_author.get(author, {})
+        # Top 2 venues by count
+        sorted_venues = sorted(
+            venue_counts.items(), key=lambda kv: kv[1], reverse=True
+        )[:2]
+        top_venues = [v for v, _ in sorted_venues]
+        enriched.append(
+            {
+                "author": author,
+                "score": score,
+                "coauthors": co_deg,
+                "scoped_papers": scoped_papers,
+                "top_venues": top_venues,
+            }
+        )
+
     return {
-        "results": rows,
-        "store_justification": "Bridge detection is a network-structure problem (betweenness). Graph analytics belong in Neo4j/GDS, not SQL or vector search.",
+        "results": enriched,
+        "store_justification": "Bridge detection is a network-structure problem (betweenness). Graph analytics belong in Neo4j/GDS, not SQL or vector search."
+        + (" Scoped to topic papers." if paper_ids else ""),
     }
 
 
@@ -1249,57 +1560,52 @@ def bridge_authors(limit: int = 20) -> dict[str, Any]:
 def citations_vs_similarity(
     q: str,
     k: int = 20,
-    paper_ids: Optional[List[str]] = Query(None, description="Use these paper IDs instead of semantic search (topic scope)"),
+    paper_ids: Optional[List[str]] = Query(
+        None, description="When set, intersect topic-scoped papers with semantic search results"
+    ),
 ) -> dict[str, Any]:
     """
     Relationship between paper citations and topic similarity.
-    Uses Qdrant to retrieve similar papers, then Postgres for citation counts; or use provided paper_ids (topic scope).
+    Uses Qdrant to retrieve similar papers, then Postgres for citation counts.
+
+    When paper_ids (topic scope) is provided, we still use semantic similarity from Qdrant
+    but intersect the hits with the scoped paper set so that similarity is interpretable
+    relative to the query while remaining within scope.
     """
-    if paper_ids:
-        # Use provided scope; no similarity scores
-        rows = []
-        with pg_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id::text, n_citation, year, venue, title
-                FROM papers
-                WHERE id = ANY(%s::uuid[])
-                """,
-                (paper_ids[:500],),
-            )
-            for r in cur.fetchall():
-                rows.append(
-                    {
-                        "paper_id": r[0],
-                        "similarity_score": None,
-                        "n_citation": r[1],
-                        "year": r[2],
-                        "venue": r[3],
-                        "title": r[4],
-                    }
-                )
-        return {
-            "query": q or "(topic scope)",
-            "results": rows,
-            "store_justification": "Using topic-scoped paper set; citation data from Postgres.",
-        }
     from fastembed import TextEmbedding
 
     embedder = TextEmbedding(model_name=settings.fastembed_model)
     vec = next(embedder.embed([q]))
     qc = qdrant_client()
+    # If a scoped paper_ids set is provided, request a larger pool of candidates from Qdrant
+    # and intersect with the scope. Otherwise, just take top-k.
+    effective_limit = max(k, 200) if paper_ids else k
     res = qc.query_points(
         collection_name=settings.qdrant_collection,
         query=vec.tolist(),
-        limit=k,
+        limit=effective_limit,
         with_payload=True,
     )
     hits = res.points
-    paper_ids = [
+    hit_ids = [
         h.payload.get("paper_id")
         for h in hits
         if h.payload and h.payload.get("paper_id")
     ]
+
+    # If scoped paper_ids are provided, intersect with the IDs returned by Qdrant
+    # so that we keep only scoped papers but preserve similarity scores.
+    if paper_ids:
+        scoped_set = set(paper_ids[:500])
+        filtered_hits = [h for h in hits if (h.payload or {}).get("paper_id") in scoped_set]
+        hits = filtered_hits[:k]
+        paper_ids = [
+            (h.payload or {}).get("paper_id")
+            for h in hits
+            if (h.payload or {}).get("paper_id")
+        ]
+    else:
+        paper_ids = hit_ids
 
     rows = []
     if paper_ids:

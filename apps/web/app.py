@@ -133,11 +133,11 @@ This app is a query router UI over three stores:
 
 Tab guide:
 
-- `Filter & explore`: Postgres-only structured queries (filtering, aggregation, joins, integrity, time, ranking).
 - `Dashboard`: overview stats from all three databases.
-- `Graph exploration`: co-authorship and indirect citation traversals.
-- `Cross-store analytics`: combined vector + SQL + graph insights.
-- `Graph analytics (GDS)`: Louvain communities and bridge-author centrality.
+- `Paper search & filters`: Postgres-only structured queries (filtering, aggregation, joins, integrity, time, ranking).
+- `Collaboration & citation networks`: co-authorship and indirect citation traversals.
+- `Topic insights & trends`: combined vector + SQL + graph insights.
+- `Advanced network analysis`: Louvain communities and bridge-author centrality.
         """
     )
 
@@ -145,10 +145,10 @@ Tab guide:
 tab_dashboard, tab_filter, tab2, tab3, tab4 = st.tabs(
     [
         "Dashboard",
-        "Filter & explore",
-        "Graph exploration",
-        "Cross-store analytics",
-        "Graph analytics (GDS)",
+        "Paper search & filters",
+        "Collaboration & citation networks",
+        "Topic insights & trends",
+        "Advanced network analysis",
     ]
 )
 
@@ -166,11 +166,11 @@ def _show_sql(data: dict | None) -> None:
 
 
 with tab_filter:
-    st.markdown("**Postgres-only** structured queries. Combine filters in **Basic filters** or run preset **Advanced analytics**.")
+    st.markdown("Find and summarize papers using filters or ready-made views.")
     tab_basic, tab_adv = st.tabs(["Basic filters", "Advanced analytics"])
 
     with tab_basic:
-        st.markdown("Build a query over papers: year range, venue, author, citation range, sort. One Postgres query—no graph or vector.")
+        st.markdown("Narrow down papers by year, venue, author, and citations, then sort the results.")
         col1, col2 = st.columns(2)
         with col1:
             year_min = st.number_input("Year min", value=2005, min_value=1900, max_value=2100, key="qb_ymin")
@@ -203,7 +203,7 @@ with tab_filter:
                 _show_sql(data)
 
     with tab_adv:
-        st.markdown("Preset analytics and data-quality checks. Each card runs one or more Postgres queries.")
+        st.markdown("See ready-made summaries (trends, venues, authors) and quick data quality checks.")
         c1, c2 = st.columns(2)
 
         with c1:
@@ -264,7 +264,7 @@ with tab_filter:
 
 with tab_dashboard:
     st.markdown("### At-a-glance statistics")
-    st.caption("Overview of Postgres, Neo4j, and Qdrant." + (" **Scoped to topic.**" if st.session_state.get("topic_paper_ids") else ""))
+    st.caption("Overview of papers, authors, venues, and graph/semantic coverage." + (" **Scoped to topic.**" if st.session_state.get("topic_paper_ids") else ""))
     data = _call_api("/stats", _scope_params())
     if not data:
         st.info("Could not reach the API. Start it with: `uvicorn apps.api.main:app --reload --port 8000` (or set API_BASE if using another port).")
@@ -280,9 +280,9 @@ with tab_dashboard:
             m2.metric("Authors", f"{pg.get('authors', 0):,}")
             m3.metric("Venues", f"{pg.get('venues', 0):,}")
             m4.metric("Total Citations", f"{pg.get('total_citations', 0):,}")
-            m5.metric("Neo4j Nodes", f"{n4.get('nodes', 0):,}")
-            m6.metric("Neo4j Relationships", f"{n4.get('relationships', 0):,}")
-            m7.metric("Qdrant Vectors", f"{qd.get('vectors', 0):,}")
+            m5.metric("Graph nodes", f"{n4.get('nodes', 0):,}")
+            m6.metric("Graph relationships", f"{n4.get('relationships', 0):,}")
+            m7.metric("Semantic vectors", f"{qd.get('vectors', 0):,}")
 
             import pandas as pd
 
@@ -340,10 +340,11 @@ with tab_dashboard:
             st.error(f"Dashboard error: {e}")
 
 with tab2:
-    st.caption("Explore graph paths and collaborations in Neo4j.")
+    st.caption("See who works with whom and how papers cite each other.")
     st.subheader("Top collaborators (co-authorship)")
+    top_collab_limit = st.slider("Number of collaborator pairs to show", 10, 100, 10, step=5)
     if st.button("Compute top collaborator pairs"):
-        data = _call_api("/top_collaborators", {"limit": 20, **_scope_params()})
+        data = _call_api("/top_collaborators", {"limit": top_collab_limit, **_scope_params()})
         if data:
             _table(data.get("results", []))
             st.info(data["store_justification"])
@@ -372,11 +373,26 @@ with tab2:
                 {"paper_id": pid.strip(), "max_hops": hops, "limit": 20},
             )
             if data:
-                _table(data.get("results", []))
+                results = data.get("results", [])
+                if results:
+                    # Aggregate by hop length for quick interpretation
+                    by_hops: dict[int, int] = {}
+                    for r in results:
+                        h = int(r.get("hops") or 0)
+                        by_hops[h] = by_hops.get(h, 0) + 1
+                    c1, c2 = st.columns(2)
+                    direct = by_hops.get(1, 0)
+                    indirect = sum(cnt for h, cnt in by_hops.items() if h > 1)
+                    c1.metric("Direct citers (1 hop)", direct)
+                    c2.metric("Indirect citers (>1 hop)", indirect)
+                    st.caption("Table below shows each citing paper and how many citation hops away it is from the target.")
+                    _table(results)
+                else:
+                    _table(results)
                 st.info(data["store_justification"])
 
 with tab3:
-    st.caption("Blend vector similarity with relational and graph analytics.")
+    st.caption("Understand how your topic connects to highly cited and emerging work.")
     st.subheader("Citations vs similarity")
     q2 = st.text_input("Topic query", value="deep learning")
     if st.button("Analyze citations vs similarity"):
@@ -398,12 +414,19 @@ with tab3:
 
     st.divider()
     st.subheader("Cross-field relevance (by venue)")
-    source_venue = st.text_input(
-        "Source venue (label only, MVP)", value="Neurocomputing"
-    )
-    target_venue = st.text_input(
-        "Target venue", value="international conference on computer vision"
-    )
+    venue_scope = _scope_params()
+    venues_data = _call_api("/filter/distinct_venues", venue_scope if venue_scope else None)
+    venue_options = [v["venue"] for v in (venues_data or {}).get("results", [])] if venues_data else []
+    if venue_options:
+        source_venue = st.selectbox("Source venue", venue_options, index=0)
+        target_venue = st.selectbox("Target venue", venue_options, index=min(1, len(venue_options) - 1))
+    else:
+        source_venue = st.text_input(
+            "Source venue (label only, MVP)", value="Neurocomputing"
+        )
+        target_venue = st.text_input(
+            "Target venue", value="international conference on computer vision"
+        )
     if st.button("Find cross-field relevant papers"):
         data = _call_api(
             "/cross_field_relevance",
@@ -431,28 +454,99 @@ with tab3:
     if st.button("Compute topic connectivity"):
         data = _call_api("/topics_connected_via_coauthorship", {"q": q2, "k": 30, **_scope_params()})
         if data:
+            paper_sample = data.get("paper_sample_size", 0)
+            author_count = data.get("author_count", 0)
+            coauth_links = data.get("coauth_links", 0)
             c1, c2, c3 = st.columns(3)
-            c1.metric("Paper sample", data.get("paper_sample_size", 0))
-            c2.metric("Authors in sample", data.get("author_count", 0))
-            c3.metric("Co-authorship links", data.get("coauth_links", 0))
+            c1.metric("Paper sample", paper_sample)
+            c2.metric("Authors in sample", author_count)
+            c3.metric("Co-authorship links", coauth_links)
+
+            # Derived connectivity measures for interpretability
+            if author_count > 0:
+                avg_links_per_author = coauth_links * 2 / author_count
+            else:
+                avg_links_per_author = 0.0
+
+            density_note = ""
+            if avg_links_per_author < 1:
+                density_note = "This topic's author community is quite fragmented: most authors coauthor with very few others."
+            elif avg_links_per_author < 3:
+                density_note = "This topic has a moderately connected community: some collaboration across authors, but still room for new bridges."
+            else:
+                density_note = "This topic's author community is densely connected: many authors coauthor with several others."
+
+            st.markdown(
+                f"**Average co-authorship links per author:** {avg_links_per_author:.2f}  \n"
+                f"{density_note}"
+            )
             st.info(data["store_justification"])
             st.caption(data.get("note", ""))
 
 with tab4:
-    st.caption("Run graph data science routines from Neo4j GDS.")
+    st.caption("Discover author communities and key connectors in the collaboration network.")
     st.subheader("Author clusters dominating a venue (Louvain)")
-    venue = st.text_input("Venue (field proxy)", value="Neurocomputing")
+    gds_scope = _scope_params()
+    gds_venues = _call_api("/filter/distinct_venues", gds_scope if gds_scope else None)
+    gds_options = [v["venue"] for v in (gds_venues or {}).get("results", [])] if gds_venues else []
+    if gds_options:
+        venue = st.selectbox("Venue (field proxy)", gds_options, index=0)
+    else:
+        venue = st.text_input("Venue (field proxy)", value="Neurocomputing")
     if st.button("Compute clusters"):
         data = _call_api("/author_clusters_by_venue", {"venue": venue, "top_k": 5})
         if data:
-            _table(data.get("top_communities", []), height=260)
+            clusters = data.get("clusters", [])
+            total_papers = data.get("total_papers_in_venue", 0)
+            if clusters:
+                # Summary table for quick comparison
+                table_rows: list[dict[str, Any]] = []
+                for c in clusters:
+                    table_rows.append(
+                        {
+                            "Rank": c.get("rank"),
+                            "Cluster": c.get("cluster_label"),
+                            "Authors": c.get("author_count"),
+                            "Papers in venue": c.get("papers_in_venue"),
+                            "Share of venue (%)": c.get("share_of_venue"),
+                        }
+                    )
+                st.markdown("**Top clusters in this venue**")
+                _table(table_rows, height=260)
+
+                st.caption(
+                    f"Total papers in venue: {total_papers:,}. Click a cluster below to see author names and a Neo4j query for visualization."
+                )
+
+                # Per-cluster details: authors and copyable Neo4j query
+                for c in clusters:
+                    rank = c.get("rank")
+                    label = c.get("cluster_label")
+                    with st.expander(f"{rank}. {label}", expanded=False):
+                        st.markdown(
+                            f"**Authors in cluster ({c.get('author_count', 0)}):**"
+                        )
+                        all_authors = c.get("all_authors", [])
+                        if all_authors:
+                            st.write(", ".join(all_authors))
+                        else:
+                            st.caption("No authors found for this cluster.")
+
+                        st.markdown(
+                            "**Neo4j query to visualize this cluster**  "
+                            "[Open Neo4j Browser](http://localhost:7474)"
+                        )
+                        st.code(c.get("neo4j_query", ""), language="cypher")
+
+            else:
+                st.warning("No clusters found for this venue.")
             st.info(data["store_justification"])
             st.caption(data.get("note", ""))
 
     st.divider()
     st.subheader("Bridge authors (betweenness centrality)")
     if st.button("Compute bridge authors"):
-        data = _call_api("/bridge_authors", {"limit": 20})
+        data = _call_api("/bridge_authors", {"limit": 20, **_scope_params()})
         if data:
             _table(data.get("results", []))
         st.info(data["store_justification"])
